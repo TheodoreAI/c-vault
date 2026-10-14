@@ -1,0 +1,27 @@
+# Build artifacts
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+cvault
+
+# Data & Uploads
+data/
+uploads/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Scratch
+scratch/
