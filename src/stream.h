@@ -22,3 +22,4 @@ int stream_serve_file(const cgi_request *req, const file_record *file, int is_do
 #endif
 
 #endif /* CVAULT_STREAM_H */
+

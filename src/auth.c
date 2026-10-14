@@ -124,3 +124,4 @@ int auth_destroy_session(const char *token) {
 
     return (rc == SQLITE_DONE) ? 0 : -1;
 }
+

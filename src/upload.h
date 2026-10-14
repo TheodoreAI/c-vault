@@ -47,3 +47,4 @@ int upload_ensure_dirs(char *out_current_dir, size_t dir_max);
 #endif
 
 #endif /* CVAULT_UPLOAD_H */
+

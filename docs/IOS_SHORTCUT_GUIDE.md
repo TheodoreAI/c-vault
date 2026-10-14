@@ -88,3 +88,4 @@ Once uploaded:
 * Your photos and videos will appear in the gallery grid.
 * Tapping any photo displays the full-resolution image.
 * Tapping a 4K video streams it inline with native scrubbing via C-Vault's HTTP 206 byte-range engine.
+

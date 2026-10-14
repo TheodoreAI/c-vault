@@ -35,3 +35,4 @@ const char *auth_get_configured_pin(void);
 #endif
 
 #endif /* CVAULT_AUTH_H */
+

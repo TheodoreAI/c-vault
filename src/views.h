@@ -27,3 +27,4 @@ void views_format_bytes(int64_t bytes, char *out, size_t out_max);
 #endif
 
 #endif /* CVAULT_VIEWS_H */
+

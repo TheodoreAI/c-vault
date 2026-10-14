@@ -92,3 +92,4 @@ To access your vault and offload photos from your iPhone when you are away from 
    http://100.x.y.z:8080/
    ```
 4. You now have an encrypted, direct WireGuard tunnel between your phone and your vault anywhere in the world. You can upload 4K videos from mobile data or hotel Wi-Fi just as if you were on your home network.
+
