@@ -20,3 +20,4 @@ C-Vault is built following the modern C + CGI + SQLite methodology outlined in [
 ## 📖 Documentation & Specification
 
 See [SPECIFICATION.md](SPECIFICATION.md) for the complete technical specification, database schema, API routes, and the GitHub project board implementation tasks.
+
