@@ -5,7 +5,20 @@ import http.cookiejar
 import json
 import sys
 
-BASE_URL = "http://127.0.0.1:8080"
+import socket
+
+def get_base_url():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return f"http://{ip}:8080"
+    except Exception:
+        return "http://127.0.0.1:8080"
+
+BASE_URL = get_base_url()
+print(f"Connecting to C-Vault test server at {BASE_URL}...")
 
 cj = http.cookiejar.CookieJar()
 opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
@@ -39,12 +52,14 @@ assert "<title>Gallery | C-Vault</title>" in dash
 print("  [PASS] Gallery dashboard rendered successfully!")
 
 print("4. Testing multipart upload of a mock iPhone photo...")
+import time
+unique_token = f"Unique iPhone 4K payload {time.time()}"
 boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
 body = (
     f"--{boundary}\r\n"
     'Content-Disposition: form-data; name="files"; filename="IMG_9999.HEIC"\r\n'
     "Content-Type: image/heic\r\n\r\n"
-    "Fake HEIC iPhone 4K binary image payload 1234567890\r\n"
+    f"{unique_token}\r\n"
     f"--{boundary}--\r\n"
 ).encode()
 
@@ -68,7 +83,7 @@ body_dup = (
     f"--{boundary}\r\n"
     'Content-Disposition: form-data; name="files"; filename="IMG_9999_copy.HEIC"\r\n'
     "Content-Type: image/heic\r\n\r\n"
-    "Fake HEIC iPhone 4K binary image payload 1234567890\r\n"
+    f"{unique_token}\r\n"
     f"--{boundary}--\r\n"
 ).encode()
 
