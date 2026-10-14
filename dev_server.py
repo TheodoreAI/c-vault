@@ -177,36 +177,15 @@ class CGIRequestHandler(BaseHTTPRequestHandler):
         sys.stdout.flush()
 
 
-class DualStackServer(HTTPServer):
-    def __init__(self, server_address, RequestHandlerClass):
-        try:
-            self.address_family = socket.AF_INET6
-            super().__init__(server_address, RequestHandlerClass)
-        except Exception:
-            self.address_family = socket.AF_INET
-            super().__init__(server_address, RequestHandlerClass)
-
-    def server_bind(self):
-        if self.address_family == socket.AF_INET6:
-            try:
-                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-            except (AttributeError, OSError):
-                pass
-        return super().server_bind()
-
-
 def run():
     local_ip = get_local_ip()
-    # Try binding to dual-stack wildcard, fallback to 0.0.0.0
-    try:
-        httpd = DualStackServer(("::", PORT), CGIRequestHandler)
-    except Exception:
-        httpd = HTTPServer(("0.0.0.0", PORT), CGIRequestHandler)
+    server_address = ("0.0.0.0", PORT)
+    httpd = HTTPServer(server_address, CGIRequestHandler)
 
     print("=" * 60, flush=True)
     print("  C-Vault Local Development Server (CGI 1.1)", flush=True)
     print("=" * 60, flush=True)
-    print(f"  Local Machine : http://localhost:{PORT}/  (or http://127.0.0.1:{PORT}/)", flush=True)
+    print(f"  Local Machine : http://127.0.0.1:{PORT}/", flush=True)
     print(f"  iPhone / Wi-Fi: http://{local_ip}:{PORT}/", flush=True)
     print("=" * 60, flush=True)
     print("  Press Ctrl+C to stop the server.", flush=True)
