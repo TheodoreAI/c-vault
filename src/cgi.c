@@ -268,6 +268,7 @@ void cgi_send_content_type(const char *content_type) {
 void cgi_send_redirect(const char *location) {
     cgi_send_status(303, "See Other");
     cgi_send_header("Location", location);
+    cgi_send_header("Content-Length", "0");
     cgi_send_headers_end();
 }
 

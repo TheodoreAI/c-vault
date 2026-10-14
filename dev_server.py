@@ -49,6 +49,7 @@ class CGIRequestHandler(BaseHTTPRequestHandler):
         self.handle_cgi()
 
     def handle_cgi(self):
+        self.close_connection = True
         if not os.path.exists(BINARY_PATH):
             self.send_error(
                 500,
