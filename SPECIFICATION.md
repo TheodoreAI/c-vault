@@ -1,27 +1,31 @@
 # C-Vault: Technical Specification & Implementation Plan
 
-A high-performance, self-hosted personal media and file vault written in C, served via CGI, and powered by SQLite. Designed specifically to offload photos, 4K videos, and documents from iPhones and laptops with zero bloat, streaming efficiency, and instant retrieval.
+This document outlines the architecture, data structures, and implementation plan for C-Vault—a personal media and file vault written in C, served through CGI, and backed by SQLite. 
 
-Based on the **BCHS** (C + CGI + SQLite) methodology outlined in [A Modern Web App in C](https://prophitt.me/writing/a-modern-web-app-in-c).
+The project was conceived to solve a straightforward, recurring problem: local storage exhaustion on iPhones. My goal was to create a lightweight, dependable way to offload photos and 4K videos to a local machine over Wi-Fi, retrieve them whenever needed, and reclaim phone storage without relying on subscription cloud services or heavy containerized software stacks.
 
----
-
-## 1. Executive Summary
-
-### 1.1 Problem Statement
-Modern iPhones produce large volumes of high-resolution media (48MP photos, 4K 60fps ProRes/HEVC videos), rapidly exhausting local storage (128GB/256GB). Commercial solutions (Apple iCloud, Google Photos, Dropbox) introduce perpetual subscription fees, privacy concerns, proprietary lock-in, and cumbersome manual export workflows. Meanwhile, existing self-hosted software (Nextcloud, Immich) often requires heavyweight containers, multi-gigabyte runtimes (Node.js, Python, Redis, Postgres), and extensive server maintenance.
-
-### 1.2 Solution
-**C-Vault** delivers a single-binary, hyper-lean alternative:
-* **Zero Runtimes**: Pure C application using CGI 1.1 and an embedded SQLite database.
-* **Low Memory Footprint**: Chunked streaming I/O handles multi-gigabyte video uploads directly to disk in fixed 64KB buffers without RAM spikes.
-* **Direct iPhone Integration**: Web-based multi-file picker from the iOS Camera Roll plus a 1-tap iOS Share Sheet Shortcut ("Upload to Vault & Prompt to Delete").
-* **Sub-Millisecond Response**: Spawns clean per-request or runs under FastCGI, with zero memory leak accumulation across requests.
-* **Resilient Storage**: Content-addressable storage with SHA-256 deduplication and SQLite metadata indexing.
+The design builds directly on the BCHS (OpenBSD, C, httpd, SQLite) methodology discussed by Corey Prophitt in [*A Modern Web App in C*](https://prophitt.me/writing/a-modern-web-app-in-c).
 
 ---
 
-## 2. Technical Architecture
+## 1. Problem Context & Design Goals
+
+### 1.1 The Practical Problem
+Modern smartphone cameras generate large volumes of data. A short 4K 60fps video can easily take 400 MB to 1 GB, and 48 MP photos quickly consume space on a 128 GB phone. Apple’s default answer is iCloud, but iCloud is designed primarily to synchronize state across Apple hardware rather than act as a pure offload drive; deleting a file on your phone often deletes it everywhere unless you manage settings carefully.
+
+Existing self-hosted alternatives like Nextcloud or Immich work well, but they require substantial infrastructure: multiple Docker containers, PostgreSQL or MariaDB instances, Redis cache layers, and dedicated background workers. For a single-user home setup, running that much software just to transfer files from a phone to a hard drive felt like more complexity than the problem required.
+
+### 1.2 Design Goals
+1. **Zero runtime dependencies:** A single compiled C binary. SQLite is vendored as a single source file (`sqlite3.c`), eliminating the need for a separate database process or external package managers.
+2. **Predictable, low memory usage:** Streaming uploads directly from standard input (`stdin`) to disk in 64 KB chunks so that a 2 GB video upload uses less than 16 MB of RAM.
+3. **Preservation of Apple media formats:** Store untouched originals (`.heic`, `.mov`, `.dng`) byte-for-byte, preserving color profiles, Apple HDR metadata, and EXIF timestamps.
+4. **Smooth in-browser media playback:** Implement HTTP 206 Partial Content so iOS Safari can scrub through 4K videos without downloading the whole file first.
+5. **Bidirectional workflow:** Allow effortless offloading to free phone space, plus quick on-demand browsing and downloading back to the Camera Roll or Files app.
+6. **Simple automation:** Provide a one-tap iOS Shortcut that uploads selected photos through the Share Sheet and prompts to delete the originals from the phone.
+
+---
+
+## 2. Technical Architecture & Fundamentals
 
 ```
                           ┌──────────────────────────────────────┐
@@ -52,32 +56,58 @@ Modern iPhones produce large volumes of high-resolution media (48MP photos, 4K 6
                     ▼                                         ▼
          ┌─────────────────────┐                   ┌────────────────────┐
          │   SQLite Database   │                   │ Filesystem Storage │
-         │   (WAL Mode Amalg.) │                   │ (vault/YYYY/MM/    │
+         │   (WAL Mode Amalg.) │                   │ (uploads/YYYY/MM/  │
          │   • Metadata & Tags │                   │  <sha256>.<ext>)   │
          │   • SHA-256 Hashes  │                   │                    │
          │   • FTS5 Search     │                   │                    │
          └─────────────────────┘                   └────────────────────┘
 ```
 
-### 2.1 Core Technology Stack
-| Layer | Technology | Rationale |
-|---|---|---|
-| **Language** | C99 / C11 | Minimal resource usage, maximum performance, portable. |
-| **Protocol** | CGI 1.1 (RFC 3875) | Simple, stateless, process-isolated, no framework lock-in. |
-| **Database** | SQLite 3 (Amalgamation) | Zero-maintenance embedded database; single C file vendored directly. |
-| **Hashing** | SHA-256 (CAmalgamation/crypto) | Content deduplication and integrity verification. |
-| **Frontend** | Vanilla HTML5 + CSS + Minimal JS | Progressive enhancement: works with standard forms, enhanced with upload progress & lightbox. |
-| **Development** | MinGW GCC / Make / Python 3 | Rapid 1-second compilation cycle and local cross-device testing. |
+### 2.1 The CGI Execution Model
+Before looking at the implementation details, it helps to understand why CGI works well for this use case. 
 
-### 2.2 Streaming & Memory Management
-* **Multipart Streamer**: Unlike traditional frameworks that load incoming files into memory buffers, `cgi_parse_multipart` reads fixed 64KB blocks from `stdin` based on `CONTENT_LENGTH`. As chunks arrive, the payload bytes are streamed directly into a temporary file on disk, maintaining peak RAM usage under 8MB regardless of upload size (tested up to 4GB+).
-* **HTTP 206 Byte-Range Streaming**: Video playback on iOS Safari requires partial content range requests (`Range: bytes=start-end`). The C binary inspects the `HTTP_RANGE` header and directly seeks (`fseeko64`) to the requested offsets, streaming only the requested chunks with `Content-Range` headers.
+Modern web development usually places an application server (like Node, Gunicorn, or Puma) behind a reverse proxy. That means you are running and monitoring two separate server processes. CGI eliminates the second long-running process entirely:
+* The web server handles network sockets and invokes our C program on each request.
+* Request parameters, cookies, and HTTP headers arrive as environment variables (`REQUEST_METHOD`, `QUERY_STRING`, `HTTP_COOKIE`, `CONTENT_LENGTH`).
+* The request body is read directly from standard input (`stdin`).
+* Response headers, status codes, and HTML or binary data are written directly to standard output (`stdout`).
+* Error messages and diagnostics are logged to standard error (`stderr`).
+
+Because each request runs in a fresh process that exits when finished, there is no chance for memory leaks or stale state to accumulate across requests. Deploying an update is as simple as compiling a new binary and replacing the old one; subsequent requests immediately execute the updated code without downtime or server restarts.
+
+### 2.2 Streaming I/O and Memory Control
+A common failure mode in web applications handling large media is buffering. If an application attempts to load an entire 1 GB or 2 GB video into memory before writing it to disk, small home servers or mini-PCs will run out of memory quickly.
+
+To prevent this, C-Vault implements a streaming multipart parser:
+1. It reads the total payload size from `CONTENT_LENGTH`.
+2. It reads chunks of fixed size (64 KB) from `stdin`.
+3. It parses the boundary markers in-flight and writes the file payload directly to a temporary file on disk (`uploads/temp/`).
+4. While writing, it updates a running SHA-256 calculation.
+5. Once the stream ends, it checks the computed hash against SQLite. If the file already exists, the temporary file is discarded to avoid duplicating data. If the file is new, it is moved to its permanent path partitioned by date: `uploads/YYYY/MM/<sha256>.<ext>`.
+
+Through this approach, process memory remains under 16 MB regardless of whether you upload a 2 MB photo or a 4 GB video.
+
+### 2.3 Media Handling & Apple Formats
+Working with iPhones introduces specific format requirements that standard web applications often miss:
+
+* **HEIC Images:** Apple devices default to High Efficiency Image Container (`.heic`) format. Converting them to JPEG during upload wastes time, strips Apple dynamic range metadata, and inflates file size. C-Vault stores the raw HEIC file untouched. Mobile Safari has native hardware decoding for HEIC and displays them directly in standard `<img>` tags. For non-Apple desktop browsers that lack native HEIC support, a lightweight client-side preview or embedded JPEG extraction is used.
+* **HEVC Videos & HTTP 206 Partial Content:** iPhone 4K and 1080p videos use the H.265 (HEVC) codec inside a `.mov` container. When iOS Safari or QuickTime attempts to play a video, it does not download the entire file first. Instead, it issues a byte-range request (`Range: bytes=0-1`) to inspect the QuickTime **MOOV atom** at the beginning or end of the container, reads index metadata, and then requests only the specific chunk needed for playback. If the server does not support HTTP 206 Partial Content, iOS Safari refuses to play the video. C-Vault handles range requests explicitly using `fseeko64()`, allowing smooth scrubbing through large video files over Wi-Fi.
+
+### 2.4 iOS Sandbox & Automation Strategy
+A web application running in Safari cannot silently inspect the Camera Roll in the background while the phone is locked. Apple’s security sandbox intentionally prevents this.
+
+Rather than fighting the operating system, C-Vault works with it through a native **iOS Shortcut**:
+1. You select a batch of photos or videos in the Apple Photos app.
+2. You tap the Share button and select "Upload to C-Vault."
+3. The shortcut sends the items via HTTP POST to `/api/upload` on your C-Vault server.
+4. When the server confirms that the files are safely stored, the shortcut prompts: *"Backed up X items. Delete originals from iPhone?"*
+5. Confirming deletes the local copies, immediately freeing up phone storage while keeping the full-resolution originals accessible on your server.
 
 ---
 
 ## 3. Database Schema
 
-Embedded SQLite database stored at `data/vault.db` running in `WAL` (Write-Ahead Logging) mode for concurrent access.
+We use an embedded SQLite database (`data/vault.db`) running in Write-Ahead Logging (`WAL`) mode to support concurrent reads while writes take place.
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -108,7 +138,7 @@ CREATE INDEX IF NOT EXISTS idx_files_media_type ON files(media_type);
 CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at);
 CREATE INDEX IF NOT EXISTS idx_files_is_deleted ON files(is_deleted);
 
--- Tags
+-- Tags for categorization
 CREATE TABLE IF NOT EXISTS tags (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE
@@ -120,7 +150,7 @@ CREATE TABLE IF NOT EXISTS file_tags (
     PRIMARY KEY(file_id, tag_id)
 );
 
--- Sessions / Auth
+-- Authentication Sessions
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     token TEXT NOT NULL UNIQUE,
@@ -128,7 +158,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     expires_at TIMESTAMP NOT NULL
 );
 
--- Full-Text Search (FTS5) for instant file discovery
+-- Full-Text Search (FTS5) for fast filename & tag discovery
 CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
     original_filename,
     media_type,
@@ -139,207 +169,167 @@ CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
 
 ---
 
-## 4. API & CGI Routing Specification
+## 4. API & CGI Routing
 
 | Method | Route | Description | Response Type |
 |---|---|---|---|
-| `GET` | `/` | Dashboard & Media Gallery (filterable by type/date) | `text/html` |
-| `GET` | `/view/:uuid` | Single media preview page with lightbox / video controls | `text/html` |
-| `GET` | `/raw/:uuid` | Direct raw file stream with HTTP 206 Partial Content | Binary (`image/*`, `video/*`, etc.) |
-| `GET` | `/download/:uuid`| Force file attachment download with original filename | `application/octet-stream` |
-| `POST`| `/upload` | Web-based multipart form upload (supports multiple files) | `303 Redirect` or JSON progress |
-| `POST`| `/api/upload` | Headless API upload designed for the iOS Shortcut | `application/json` |
-| `POST`| `/delete/:uuid`| Soft-delete file (move to trash) | `303 Redirect` |
-| `POST`| `/restore/:uuid`| Restore soft-deleted file | `303 Redirect` |
-| `POST`| `/purge/:uuid` | Permanent deletion from disk and database | `303 Redirect` |
-| `GET` | `/stats` | Storage analytics & savings counter | `text/html` or JSON |
-| `GET/POST`| `/login` | Simple PIN/passphrase authentication & session cookie | `text/html` / `303 Redirect` |
+| `GET` | `/` | Main dashboard and media gallery (filterable by type and date) | `text/html` |
+| `GET` | `/view/:uuid` | Single media preview page with video player or photo viewer | `text/html` |
+| `GET` | `/raw/:uuid` | Direct media stream with HTTP 206 Partial Content support | Binary (`image/*`, `video/*`) |
+| `GET` | `/download/:uuid`| Triggers file attachment download with original filename | `application/octet-stream` |
+| `POST`| `/upload` | Multipart form upload for browser UI (handles multiple files) | `303 See Other` redirect |
+| `POST`| `/api/upload` | Headless API endpoint designed for the iOS Shortcut | `application/json` |
+| `POST`| `/delete/:uuid`| Moves a file to trash (`is_deleted = 1`) | `303 See Other` redirect |
+| `POST`| `/restore/:uuid`| Restores a file from trash | `303 See Other` redirect |
+| `POST`| `/purge/:uuid` | Permanently deletes a file from disk and database | `303 See Other` redirect |
+| `GET` | `/stats` | Summary of total stored files, disk usage, and reclaimed space | `text/html` or JSON |
+| `GET/POST`| `/login` | Simple PIN/passphrase authentication and cookie issuance | `text/html` / `303 See Other` |
 
 ---
 
-## 5. iOS Shortcut Automation Workflow
+## 5. Implementation Tasks (GitHub Project Board)
 
-To seamlessly solve the iPhone storage exhaustion issue:
-
-```
-[iPhone User] 
-     │
-     ▼
-Selects 20 photos & 4K videos in Apple Photos app
-     │
-     ▼
-Taps Share Sheet ──▶ Selects "Upload to C-Vault" Shortcut
-                          │
-                          ▼
-            [iOS Shortcut Executes in Background]
-            1. Loops over selected media items
-            2. Sends POST to https://<host>/api/upload
-               with Bearer Token / API Key
-            3. Checks HTTP 200 JSON { "status": "success", "deduped": false }
-                          │
-                          ▼
-            [iOS Shortcut Prompts User]
-            "20 items safely backed up to C-Vault (1.4 GB freed).
-             Delete selected photos from your iPhone?"
-                          │
-                   ┌──────┴──────┐
-                   │             │
-               [Confirm]      [Cancel]
-                   │             │
-                   ▼             ▼
-             Originals      Originals
-             Deleted        Preserved
-             from iPhone
-```
-
----
-
-## 6. GitHub Project Board: Epics & Tasks Breakdown
-
-The following tasks are formatted for direct entry into a GitHub Project board (columns: **Backlog**, **Ready**, **In Progress**, **Review**, **Done**).
+The tasks below are organized into sequential epics and structured for direct tracking on a GitHub project board.
 
 ---
 
 ### Epic 1: Project Skeleton & Build System
 
-#### Task 1.1: Initialize Project Directory & Vendored Dependencies
+#### Task 1.1: Project Directory Structure & SQLite Vendoring
 * **Labels**: `setup`, `c-lang`, `database`
-* **Description**: Create folder structure (`src/`, `data/`, `uploads/`, `public/`). Download and vendor SQLite amalgamation (`sqlite3.c`, `sqlite3.h`) version 3.45+ and SHA-256 implementation.
+* **Description**: Establish the standard directory layout (`src/`, `data/`, `uploads/`, `public/`). Vendor the official SQLite amalgamation (`sqlite3.c`, `sqlite3.h`) directly into `src/` alongside an embedded SHA-256 implementation.
 * **Acceptance Criteria**:
-  - `src/sqlite3.c` and `src/sqlite3.h` present and clean.
-  - Directory structure adheres to standard C layout.
-  - Git ignore ignores build artifacts (`.exe`, `.o`, `data/`, `uploads/`).
+  - `src/sqlite3.c` and `src/sqlite3.h` are vendored and build cleanly.
+  - Required directories are created and `.gitignore` correctly ignores build artifacts, database files, and uploaded media.
 
-#### Task 1.2: Makefile & Cross-Platform Compilation
+#### Task 1.2: Makefile Configuration
 * **Labels**: `build`, `c-lang`
-* **Description**: Write a robust `Makefile` compatible with MinGW GCC (Windows) and clang/gcc (Linux/BSD/macOS). Enable optimization flags (`-O2`), warnings (`-Wall -Wextra`), and link pthread/dl for SQLite.
+* **Description**: Create a portable `Makefile` supporting MinGW GCC on Windows as well as GCC/Clang on Linux and macOS. Use optimization flags (`-O2`), standard warnings (`-Wall -Wextra`), and appropriate threading/math links for SQLite.
 * **Acceptance Criteria**:
-  - Running `make` compiles the project to `cvault` (or `cvault.exe`) in under 5 seconds.
-  - Clean target (`make clean`) removes intermediate objects.
+  - Running `make` compiles the full project into `cvault` (or `cvault.exe`) in under 5 seconds.
+  - Running `make clean` removes all intermediate object files.
 
-#### Task 1.3: Python CGI Local Development Server
-* **Labels**: `devops`, `tooling`
-* **Description**: Implement `dev_server.py` to route HTTP requests to the compiled CGI binary, bind to `0.0.0.0:8080`, and display the machine's local Wi-Fi IP so iPhones on the same network can immediately connect.
+#### Task 1.3: Local Development Server Harness (`dev_server.py`)
+* **Labels**: `tooling`, `devops`
+* **Description**: Write a lightweight Python script that acts as a local CGI server for testing. It should bind to `0.0.0.0:8080`, print the host computer's local Wi-Fi IP address, set standard CGI environment variables, and route requests to the compiled `cvault` binary.
 * **Acceptance Criteria**:
-  - Running `python dev_server.py` launches the server and prints LAN IP (e.g. `http://192.168.1.50:8080`).
-  - Correctly sets CGI environment variables (`REQUEST_METHOD`, `QUERY_STRING`, `PATH_INFO`, `CONTENT_LENGTH`, `CONTENT_TYPE`, `HTTP_COOKIE`, `HTTP_RANGE`).
-  - Pipes `stdin` and reads `stdout` from `cvault.exe`.
+  - Running `python dev_server.py` starts the server and displays the local LAN address (e.g. `http://192.168.1.50:8080`).
+  - An iPhone on the same Wi-Fi network can connect to the server and receive valid HTTP responses.
 
 ---
 
 ### Epic 2: Core CGI & Database Foundation
 
-#### Task 2.1: CGI Abstraction Library (`cgi.h` / `cgi.c`)
+#### Task 2.1: CGI Environment & Request Helpers (`cgi.c` / `cgi.h`)
 * **Labels**: `backend`, `c-lang`
-* **Description**: Build a reusable CGI utility library to parse environment variables, parse query parameters (`?key=value`), parse URL-encoded form bodies, extract cookies, and emit standard HTTP headers (`Content-Type`, `Status`, `Set-Cookie`, `Location`).
+* **Description**: Implement helper functions to parse CGI environment variables, decode query parameters (`?key=value`), parse URL-encoded form data, extract cookies, and emit standard HTTP headers (`Content-Type`, `Status`, `Set-Cookie`, `Location`). Include an `html_escape` helper to prevent XSS.
 * **Acceptance Criteria**:
-  - Query parameters and cookies can be looked up with `cgi_param(req, "key")`.
-  - Proper URL decoding handling `%20`, `+`, and Unicode.
-  - HTML escaping helper function (`html_escape`) prevents XSS vulnerabilities.
+  - Request parameters and cookies can be queried by name via helper functions.
+  - URL decoding handles spaces, `+`, and special characters properly.
+  - Output functions correctly format HTTP header boundaries with standard CRLF line endings.
 
-#### Task 2.2: SQLite Database Controller (`db.h` / `db.c`)
+#### Task 2.2: SQLite Database Controller (`db.c` / `db.h`)
 * **Labels**: `database`, `c-lang`
-* **Description**: Implement database initialization, schema migration execution, connection pooling/open-close lifecycle per CGI process, and WAL mode enablement.
+* **Description**: Write database initialization routines that execute schema migrations on startup, enable WAL mode, configure busy timeouts to handle concurrency, and provide clean functions for querying and inserting file records.
 * **Acceptance Criteria**:
-  - Auto-creates `data/vault.db` and executes tables initialization if not present.
-  - Handles database busy/locked states gracefully with busy timeouts.
-  - Clean query wrappers for inserting and querying records.
+  - `data/vault.db` is created automatically on first run with all tables and indexes.
+  - Concurrent requests do not fail with database lock errors under normal local usage.
 
 #### Task 2.3: SHA-256 Deduplication & Storage Manager
 * **Labels**: `storage`, `c-lang`
-* **Description**: Implement cryptographic SHA-256 calculation on streamed data. Verify against the `files` table before finalizing storage. If a duplicate hash exists, reference the existing record or link without duplicating disk storage.
+* **Description**: Compute cryptographic SHA-256 hashes of incoming data streams. Before saving a file permanently, check if the hash already exists in SQLite. If it does, record the new entry without writing duplicate bytes to disk.
 * **Acceptance Criteria**:
-  - Uploading the identical file twice results in deduplication detection.
-  - Storage path partition format (`uploads/YYYY/MM/<hash>.<ext>`) avoids single-folder inode overload.
+  - Uploading the exact same image twice results in a single file stored on disk.
+  - Files are organized into `uploads/YYYY/MM/<sha256>.<ext>` to avoid single-directory file count limits.
 
 ---
 
-### Epic 3: High-Performance Upload & Streaming Engine
+### Epic 3: Upload & Media Streaming Subsystem
 
 #### Task 3.1: Chunked Multipart/Form-Data Parser
 * **Labels**: `backend`, `c-lang`, `performance`
-* **Description**: Implement a low-memory multipart streaming parser. Read `stdin` in 64KB chunks, extract boundary headers, stream the file payload directly into `uploads/temp/` without loading into RAM, and rename upon completion.
+* **Description**: Implement a streaming multipart parser that reads `stdin` in fixed 64 KB chunks based on `CONTENT_LENGTH`. Stream file contents directly to disk in `uploads/temp/` without loading entire files into memory.
 * **Acceptance Criteria**:
-  - Successfully uploads 500MB+ video file on low-memory environments (<16MB RAM peak).
-  - Handles multi-file uploads in a single request.
-  - Cleans up incomplete temporary files on abort.
+  - A 1 GB+ video file uploads successfully while peak process RAM stays below 16 MB.
+  - Interrupted or failed uploads clean up temporary files cleanly.
 
-#### Task 3.2: HTTP 206 Partial Content Byte-Range Video Streamer
+#### Task 3.2: HTTP 206 Partial Content Video Streamer
 * **Labels**: `backend`, `c-lang`, `media`
-* **Description**: Implement HTTP 206 Range request handling for video playback (`.mp4`, `.mov`, `.webm`). Parse `Range: bytes=start-end`, seek file pointer, set `Content-Range: bytes start-end/total`, and stream byte chunks.
+* **Description**: Implement byte-range request handling for video playback (`.mp4`, `.mov`). Parse `Range: bytes=start-end`, seek within the target file using `fseeko64()`, emit `Content-Range: bytes start-end/total`, and stream the requested byte segment.
 * **Acceptance Criteria**:
-  - iPhone Safari video player can scrub back and forth through a 4K video instantly without freezing or buffering the entire file.
-  - Returns `200 OK` if no `Range` header is present, and `206 Partial Content` when present.
+  - An iPhone playing a 4K `.mov` video in Safari can scrub forward and backward smoothly without buffering the entire file.
+  - Requests without a `Range` header return standard `200 OK` responses.
 
 #### Task 3.3: Headless API Endpoint for iOS Shortcuts (`/api/upload`)
 * **Labels**: `api`, `ios`, `backend`
-* **Description**: Create a dedicated JSON endpoint accepting POST uploads with an API authorization header (`Authorization: Bearer <TOKEN>`), returning JSON `{ "status": "ok", "uuid": "...", "filename": "...", "size": 123456 }`.
+* **Description**: Build a dedicated JSON endpoint that accepts POST uploads accompanied by an authorization token (`Authorization: Bearer <TOKEN>`) and returns a concise JSON status object with the file UUID, size, and deduplication status.
 * **Acceptance Criteria**:
-  - Works with `curl` and iOS Shortcut "Get Contents of URL" action.
-  - Rejects unauthorized requests with HTTP 401 JSON response.
+  - Endpoint works reliably with `curl` and the iOS Shortcut "Get Contents of URL" action.
+  - Requests with missing or invalid tokens return a `401 Unauthorized` JSON response.
 
 ---
 
 ### Epic 4: User Interface & Mobile Experience
 
-#### Task 4.1: Responsive Componentized HTML/CSS Views (`views.h` / `views.c`)
+#### Task 4.1: Responsive Semantic Views in C (`views.c` / `views.h`)
 * **Labels**: `frontend`, `c-lang`, `ui`
-* **Description**: Write clean C functions that generate semantic, responsive HTML5 with modern CSS (dark/light theme, system fonts, mobile-optimized grid).
+* **Description**: Create functions in C that generate clean, semantic HTML5 with embedded CSS. Design mobile-first for iPhone viewports (390px to 430px wide) while adapting gracefully to desktop screens. Include dark and light mode support based on system settings.
 * **Acceptance Criteria**:
-  - Fully responsive on iPhone screens (390px to 430px width) up to 4K desktops.
-  - Zero external CSS/JS framework dependencies (embedded clean CSS in under 15KB).
+  - UI renders correctly on mobile Safari and desktop browsers without horizontal scrolling or broken layouts.
+  - Entire embedded CSS bundle is under 15 KB with zero third-party framework dependencies.
 
-#### Task 4.2: Mobile Upload Hub with Live Progress & Batch Selection
+#### Task 4.2: Mobile Upload Hub with Live Progress Bars
 * **Labels**: `frontend`, `mobile`, `ux`
-* **Description**: Implement mobile-optimized file input `<input type="file" multiple accept="image/*,video/*">` with drag-and-drop support, file queue listing, and JavaScript `XMLHttpRequest` progress tracking for real-time progress bars.
+* **Description**: Implement a multi-file upload zone with `<input type="file" multiple accept="image/*,video/*">`. Use vanilla JavaScript with `XMLHttpRequest` to show live upload progress bars for each selected file, while preserving standard form submission fallback when JavaScript is disabled.
 * **Acceptance Criteria**:
-  - Selecting 20+ photos on iPhone displays progress bar for each file.
-  - Graceful fallback for non-JS browsers via standard form POST.
+  - Selecting 20+ photos on an iPhone displays real-time percentage progress for each item.
+  - Successfully uploaded items trigger an automatic gallery refresh.
 
-#### Task 4.3: Gallery Grid, Filters & Storage Dashboard
+#### Task 4.3: Media Gallery Grid, Filters & Storage Metrics
 * **Labels**: `frontend`, `ui`, `database`
-* **Description**: Display media in a clean thumbnail grid with tabs: **All**, **Photos**, **Videos**, **Documents**, **Favorites**, **Trash**. Include a dashboard widget showing: Total Files, Total Size (GB), and Estimated iPhone Storage Saved.
+* **Description**: Render uploaded media in a clean grid layout. Provide tabs to filter by type (**All**, **Photos**, **Videos**, **Documents**, **Trash**) and display a summary card showing total files stored, total gigabytes, and estimated iPhone storage saved.
 * **Acceptance Criteria**:
-  - Filtering by type triggers instant reload or client-side filtering.
-  - Formatted file sizes (KB, MB, GB) and human-readable dates.
+  - Clicking filter tabs updates the media list promptly.
+  - File sizes and timestamps are formatted clearly (e.g. "14.2 MB", "Oct 14, 2026").
 
-#### Task 4.4: Fullscreen Lightbox & Media Modal
+#### Task 4.4: Fullscreen Lightbox & In-Line Player
 * **Labels**: `frontend`, `media`, `mobile`
-* **Description**: Lightweight lightbox modal allowing fullscreen photo viewing with swipe/arrow navigation, download button, delete button, and native HTML5 video player with controls.
+* **Description**: Build a lightweight media modal for viewing full-size images and playing videos inline. Include swipe or arrow navigation between items, a direct download button, and a delete button.
 * **Acceptance Criteria**:
-  - Smooth photo navigation on mobile touch.
-  - Videos autoplay inline with audio toggle.
+  - Photos can be viewed at full resolution and saved back to the iOS Camera Roll.
+  - Videos stream inline with standard audio and playback controls.
 
 ---
 
-### Epic 5: Security, Auth & iOS Integration
+### Epic 5: Authentication, Security & Deployment
 
-#### Task 5.1: PIN / Passphrase Authentication & Session Cookies
+#### Task 5.1: Passphrase Authentication & Session Cookies
 * **Labels**: `security`, `auth`, `backend`
-* **Description**: Implement simple passphrase or 6-digit PIN protection. Valid submissions issue a secure, HTTP-only cookie with an expiration date stored in the `sessions` table.
+* **Description**: Implement simple PIN or passphrase protection. Successful logins issue an HTTP-only, secure session cookie stored in the `sessions` table. Unauthenticated requests from the local network are redirected to `/login`.
 * **Acceptance Criteria**:
-  - Unauthenticated visitors on LAN are redirected to `/login`.
-  - Secure session token generated using cryptographically strong random bytes.
+  - Unauthorized requests cannot view or download media.
+  - Session tokens are generated using cryptographically random bytes and expire after a configurable duration.
 
-#### Task 5.2: iOS Shortcut Recipe & Deployment Guide
+#### Task 5.2: iOS Shortcut Recipe & Documentation
 * **Labels**: `documentation`, `ios`, `automation`
-* **Description**: Create a step-by-step iOS Shortcut recipe and iCloud shortcut link / JSON configuration that users can install in 1 click, allowing photo sharing directly from the iOS Share Sheet.
+* **Description**: Document the exact step-by-step configuration for creating the iOS Share Sheet Shortcut ("Upload to C-Vault & Prompt to Delete"). Provide clear screenshots and an exportable shortcut file.
 * **Acceptance Criteria**:
-  - Complete illustrated instructions in `docs/IOS_SHORTCUT_GUIDE.md`.
-  - Verified working on iOS 16+.
+  - A user following `docs/IOS_SHORTCUT_GUIDE.md` can set up the shortcut on iOS 16+ within 5 minutes.
+  - The shortcut uploads selected photos and prompts to delete local copies upon success.
 
-#### Task 5.3: Production Deployment Guide (Systemd / Tailscale / Nginx)
+#### Task 5.3: Production Setup & Remote Access Guide
 * **Labels**: `documentation`, `devops`
-* **Description**: Document how to keep C-Vault running as a background service on Windows (PowerShell/nssm) or Linux/OpenBSD (systemd/rc.d) and connect securely via Tailscale for remote access away from home Wi-Fi.
+* **Description**: Provide documentation for running C-Vault as a background service on Windows (PowerShell/nssm) and Linux/OpenBSD (systemd/rc.d). Detail how to connect securely away from home using Tailscale or a reverse proxy.
 * **Acceptance Criteria**:
-  - `README.md` includes simple instructions for Windows, Linux, and OpenBSD deployment.
+  - Documentation covers running the binary behind standard web servers (`httpd`, `nginx`, `lighttpd`).
+  - Tailscale setup instructions explain how to access the vault securely without opening router ports.
 
 ---
 
-## 7. Definition of Done (DoD)
-1. **Compilation**: Clean compile with GCC with `-Wall -Wextra -O2` with zero errors and zero warnings.
-2. **Performance**: Memory consumption during 1GB video upload remains under 16MB RAM.
-3. **iPhone Compatibility**: Works natively on iOS Safari without layout breaking.
-4. **Reliability**: Uploads survive network interruptions cleanly without corrupting the SQLite database.
-5. **No Bloat**: Total compiled binary size under 3MB (including vendored SQLite).
+## 6. Definition of Done (DoD)
 
+1. **Build Quality:** The codebase compiles cleanly with GCC using `-Wall -Wextra -O2` with zero errors and zero warnings.
+2. **Resource Constraints:** Process memory remains under 16 MB during a 1 GB video upload.
+3. **Apple Compatibility:** `.heic` photos display natively in Safari, and `.mov` videos support smooth scrubbing via HTTP 206 range requests.
+4. **Data Integrity:** Interrupted uploads do not leave orphan records in SQLite, and duplicate uploads are recognized without wasting disk space.
+5. **Self-Contained:** The compiled binary and vendored SQLite require no external runtime dependencies to operate.
