@@ -11,7 +11,7 @@ import socket
 import urllib.parse
 import subprocess
 import shutil
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PORT = 8080
 BINARY_NAME = "cvault.exe" if sys.platform == "win32" else "cvault"
@@ -89,20 +89,21 @@ class CGIRequestHandler(BaseHTTPRequestHandler):
             env[norm_key] = val
 
         try:
-            # Spawn the C binary
+            # Spawn the C binary with 1 MB pipe buffer
             proc = subprocess.Popen(
                 [BINARY_PATH],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                bufsize=1048576,
                 env=env,
             )
 
-            # Stream request body from client directly to binary stdin in 64 KB chunks
+            # Stream request body from client directly to binary stdin in 1 MB chunks
             if content_length > 0 and self.rfile:
                 bytes_left = content_length
                 while bytes_left > 0:
-                    chunk_size = min(65536, bytes_left)
+                    chunk_size = min(1048576, bytes_left)
                     chunk = self.rfile.read(chunk_size)
                     if not chunk:
                         break
@@ -143,10 +144,10 @@ class CGIRequestHandler(BaseHTTPRequestHandler):
                 self.send_header(k, v)
             self.end_headers()
 
-            # Stream response body directly back to client in 64 KB chunks
+            # Stream response body directly back to client in 1 MB chunks
             if self.command != "HEAD":
                 while True:
-                    chunk = proc.stdout.read(65536)
+                    chunk = proc.stdout.read(1048576)
                     if not chunk:
                         break
                     self.wfile.write(chunk)
@@ -181,7 +182,7 @@ class CGIRequestHandler(BaseHTTPRequestHandler):
 def run():
     local_ip = get_local_ip()
     server_address = ("0.0.0.0", PORT)
-    httpd = HTTPServer(server_address, CGIRequestHandler)
+    httpd = ThreadingHTTPServer(server_address, CGIRequestHandler)
 
     print("=" * 60, flush=True)
     print("  C-Vault Local Development Server (CGI 1.1)", flush=True)

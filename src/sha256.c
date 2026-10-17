@@ -89,15 +89,36 @@ void sha256_init(sha256_ctx *ctx) {
 }
 
 void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len) {
-    size_t i;
-    for (i = 0; i < len; ++i) {
-        ctx->data[ctx->datalen] = data[i];
-        ctx->datalen++;
-        if (ctx->datalen == 64) {
-            sha256_transform(ctx, ctx->data);
-            ctx->bitlen += 512;
-            ctx->datalen = 0;
+    if (len == 0) return;
+
+    /* If there is leftover data in buffer, fill up to 64 bytes first */
+    if (ctx->datalen > 0) {
+        size_t space = 64 - ctx->datalen;
+        if (len < space) {
+            memcpy(ctx->data + ctx->datalen, data, len);
+            ctx->datalen += (uint32_t)len;
+            return;
         }
+        memcpy(ctx->data + ctx->datalen, data, space);
+        sha256_transform(ctx, ctx->data);
+        ctx->bitlen += 512;
+        ctx->datalen = 0;
+        data += space;
+        len -= space;
+    }
+
+    /* Process full 64-byte blocks directly from input buffer (zero-copy) */
+    while (len >= 64) {
+        sha256_transform(ctx, data);
+        ctx->bitlen += 512;
+        data += 64;
+        len -= 64;
+    }
+
+    /* Save remaining tail bytes (< 64) */
+    if (len > 0) {
+        memcpy(ctx->data, data, len);
+        ctx->datalen = (uint32_t)len;
     }
 }
 

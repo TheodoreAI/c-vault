@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS ?= -Wall -Wextra -O2 -std=c11 -Isrc
+CFLAGS ?= -Wall -Wextra -O3 -march=native -std=c11 -Isrc
 SQLITE_FLAGS ?= -O2 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1 -w
 
 # OS detection

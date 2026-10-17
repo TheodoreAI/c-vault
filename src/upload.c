@@ -19,7 +19,7 @@
 #define SET_BINARY_MODE(handle) ((void)0)
 #endif
 
-#define CHUNK_SIZE 65536
+#define CHUNK_SIZE 1048576
 
 static void make_path_dirs(const char *path) {
     char temp[512];
@@ -125,10 +125,16 @@ static void extract_header_filename(const char *header_line, char *filename, siz
 static int memsearch(const uint8_t *haystack, size_t haystack_len,
                      const uint8_t *needle, size_t needle_len) {
     if (needle_len == 0 || haystack_len < needle_len) return -1;
-    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
-        if (haystack[i] == needle[0] && memcmp(haystack + i, needle, needle_len) == 0) {
-            return (int)i;
+    const uint8_t first = needle[0];
+    const uint8_t *cur = haystack;
+    const uint8_t *end = haystack + (haystack_len - needle_len);
+    while (cur <= end) {
+        const uint8_t *match = (const uint8_t *)memchr(cur, first, (size_t)(end - cur + 1));
+        if (!match) return -1;
+        if (memcmp(match, needle, needle_len) == 0) {
+            return (int)(match - haystack);
         }
+        cur = match + 1;
     }
     return -1;
 }
@@ -145,6 +151,7 @@ int upload_process_multipart(const cgi_request *req, upload_batch *batch) {
     }
 
     SET_BINARY_MODE(stdin);
+    setvbuf(stdin, NULL, _IOFBF, 262144);
 
     char delimiter[256];
     snprintf(delimiter, sizeof(delimiter), "\r\n--%s", boundary);
@@ -249,6 +256,7 @@ int upload_process_multipart(const cgi_request *req, upload_batch *batch) {
                 batch->file_count++;
                 continue;
             }
+            setvbuf(out_f, NULL, _IOFBF, 262144);
 
             sha256_ctx sha_ctx;
             sha256_init(&sha_ctx);
@@ -339,7 +347,7 @@ int upload_process_multipart(const cgi_request *req, upload_batch *batch) {
                     FILE *src = fopen(temp_path, "rb");
                     FILE *dst = fopen(final_path, "wb");
                     if (src && dst) {
-                        uint8_t cbuf[CHUNK_SIZE];
+                        uint8_t cbuf[65536];
                         size_t cr;
                         while ((cr = fread(cbuf, 1, sizeof(cbuf), src)) > 0) {
                             fwrite(cbuf, 1, cr, dst);
